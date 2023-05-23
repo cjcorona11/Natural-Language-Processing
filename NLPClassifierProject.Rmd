@@ -1,38 +1,480 @@
 ---
-title: "CSCI 550 Final Project"
+title: "fakenews"
 author: "Mark Braun, Chris Corona"
 date: "`r Sys.Date()`"
 output: pdf_document
 ---
 
-# Abstract
-In today’s fast-paced world with 24-hour news cycles, we are constantly being bombarded with information. Sometimes it can be hard to determine if a news article is fake or real, especially breaking news where the full details are not yet known. We have seen fake news used as a weapon to mislead and misinform the public. In many cases fake news has been used to undermine democracy by spreading falsehoods about political issues and even elections. It is important that we can separate truth from fiction. In this project, we will develop various machine learning models that will be trained to tell the difference between fake and real news articles. The models will take as an input the full text article and will output a binary response as either “fake” or “real”. Any consumer of news might find this tool helpful to determine if a news article is worthy of reading. Social media apps where news articles are posted and shared in real-time might find interest in such a tool as a sort of censor or filter - possibly blocking fake news from being posted or adding a disclaimer message to posts that may contain fake news. Maybe even public officials would want this tool to evaluate the messaging being circulated about a particular topic, so that the officials can specifically correct any outside attempts at misinformation.
+```{r Load Data, echo=F, message=F, warning=F}
+library(tidyverse)
+news <- read_csv("fake_or_real_news.csv")
 
-# 1 Introduction
-The dataset that we’ll be training and evaluating our models on is an updated version of the McIntire dataset (https://github.com/lutzhamel/fake-news). This is a synthesis of 6,335 fake and real news articles from various web sources. According to George McIntire, the fake articles came directly from a Kaggle data set called "Getting Real About Fake News" (https://www.kaggle.com/datasets/mrisdal/fake-news), and all were published in the month leading up to the 2016 presidential election from October 25 to November 25, 2016. The real articles were scraped by George from All Sides (http://www.allsides.com/), a website dedicated to hosting news and opinion articles from across the political spectrum. These real articles include left, center, and right-leaning articles from numerous media outlets published between 2015 and 2016. It is a balanced data set with 3,164 fake and 3,171 real articles. For each article, the data set contains 4 features: A unique ID number, the article’s title, the article’s text, and the response variable of whether or not the article is fake or real news.
+summary(factor(news$label))
+```
 
-We will attempt to fit four different classes of model for this problem: logistic regression, Naive Bayes, random forest, and neural network. The most basic model we will fit is a logistic regression model which will serve as a baseline to compare the other, more sophisticated models. In logistic regression, we transform a linear model with the logit function to calculate the probability of a binary outcome - “fake” or “real” news.
+```{r Preprocessing, echo=F, message=F, warning=F}
+library(tm)
+# create corpus of text
+corpus <- VCorpus(VectorSource(news$text))
+# convert to all lowercase
+corpus = tm_map(corpus, content_transformer(tolower))
+# remove punctuation
+corpus = tm_map(corpus, content_transformer(removePunctuation))
+# remove stopwords
+corpus = tm_map(corpus, removeWords, c(stopwords("english")))
+# stemming
+library(SnowballC)
+corpus = tm_map(corpus, stemDocument)
+# remove stopwords one more time (stemming created some stopwords again - why?)
+corpus = tm_map(corpus, removeWords, c(stopwords("english"), "via", "hes", "doesnt", "didnt", "isnt"))
+# create document term matrix
+frequencies = DocumentTermMatrix(corpus)
+# remove terms with frequencies < 0.05
+sparse = removeSparseTerms(frequencies, 0.95)
+# create data frame of sparse frequencies (including labels)
+tSparse = as.data.frame(as.matrix(sparse))
+colnames(tSparse) = make.names(colnames(tSparse), unique=T)
+tSparse$label <- as.factor(news$label)
+```
 
-Next, we will use a Naive Bayes model, which is slightly more complex than logistic regression, bolsters independence assumptions amongst features, and uses class conditional probabilities to classify examples. It is important to note that our feature set for this investigation, a set of words or n-grams, are likely not independent due to in-article context, and so we might expect lessened performance on this model.
+```{r Fakest/Realest Words, echo=F, message=F, warning=F}
+library(tidyverse)
+# fakest/realest words
+# sum the number of times each word appears in each article label
+agg <- aggregate(select(tSparse,-c(label)), by=as.data.frame(tSparse$label), FUN=sum)
+# (add one so we don't divide by zero in the next step)
+agg[,-1] <- agg[,-1] + 1
+# get the ratios: divide by the number of fake / real articles respectively
+agg[1,-1] <- agg[1,-1]/3164
+agg[2,-1] <- agg[2,-1]/3171
+fakeness_ratio <- agg[1,-1]/agg[2,-1]
+realness_ratio <- agg[2,-1]/agg[1,-1]
+# calculate fakest/realest words
+fakest <- sort(fakeness_ratio, decreasing=T)[1:30]
+realest <- sort(realness_ratio, decreasing=T)[1:30]
+# plot fakest/realest words
+par(mfrow=c(2,1))
+barplot(as.numeric(fakest), names.arg=colnames(fakest), las=2, main="Fakest Words")
+barplot(as.numeric(realest), names.arg=colnames(realest), las=2, main="Realest Words")
+```
 
-Third, we will fit a decision tree based model that will attempt to stratify articles into real and fake classes based on some combination of words or phrases that are found within these articles. We will likely use the basic greedy approach of identifying words/phrases that are most strongly associated with real/fake articles and split based on these first. 
+```{r Null Accuracy, echo=F, message=F, warning=F}
+prop.table(table(tSparse$label))
+```
 
-Finally, we will experiment with a simple neural net to classify articles as real or fake. We will likely use a basic multi-layer perceptron, with an input layer that accepts words or n-grams as features, an output layer with 1 node representing a probability of the positive class (similar to logistic regression), and 1 or 2 hidden layers with some number of nodes between the number of inputs and the number of outputs. Number of hidden layers, number of nodes in hidden layers, and learning rate are all hyperparameters that likely need to be tuned.
+```{r Train/Test Split, echo=F, message=F, warning=F}
+# variables to split data into train and test sets
+n <- dim(tSparse)[1]
+k <- 10
+n_k <- floor(n/k)
+indices <- 1:n
+split <- sample(indices, n, replace=F)
 
-For each model, we will employ 10-fold cross validation to evaluate final results, as well as using a hold-out tuning set for tuning hyperparameters for those models that require such.
+# function for calculating accuracy, precision, recall, and F1 score
+score <- function(prediction, actual) {
+  accuracy <- mean(prediction == actual)
+  cat("Accuracy: ", accuracy, "\n")
+  precision <- sum(prediction == "FAKE" & prediction == actual)/sum(prediction == "FAKE")
+  cat("Precision: ", precision, "\n")
+  recall <- sum(prediction == "FAKE" & prediction == actual)/sum(actual == "FAKE")
+  cat("Recall: ", recall, "\n")
+  f1 <- 2*precision*recall/(precision+recall)
+  cat("F1: ", f1, "\n")
+  out <- rep(0,4)
+  out[1:4] = c(accuracy, precision, recall, f1)
+  return(out)
+}
+```
+
+```{r Naive Bayes, echo=F, message=F, warning=F}
+library(e1071)
+
+# initialize scores matrix
+scores <- matrix(,nrow=k,ncol=4)
+
+for(i in 1:(k-1)) {
+  # train/test split
+  train <- tSparse[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test <- tSparse[split[(((i-1)*n_k)+1):(i*n_k)],]
+  # train RF model
+  modelNB = naiveBayes(label ~ ., data=train)
+  # predict with RF
+  predictNB = predict(modelNB, newdata=test)
+  # confusion matrix
+  cat("\n#######################\n")
+  table(test$label, predictNB)
+  cat("\n")
+  scores[i,] <- score(predictNB, test$label)
+}
+# need one more iteration outside for-loop to account for remaining
+# observations (6335-9*633) because n/k is not an integer
+i <- k
+# train/test split
+train <- tSparse[-split[(((i-1)*n_k)+1):dim(tSparse)[1]],]
+test <- tSparse[split[(((i-1)*n_k)+1):dim(tSparse)[1]],]
+# train RF model
+modelNB = naiveBayes(label ~ ., data=train)
+# predict with RF
+predictNB = predict(modelNB, newdata=test)
+# confusion matrix
+cat("\n#######################\n")
+table(test$label, predictNB)
+cat("\n")
+scores[i,] <- score(predictNB, test$label)
+
+# k-fold average scores
+avg_score <- rep(NA, 4)
+for(i in 1:4) {
+  avg_score[i] <- mean(scores[,i])
+}
+avg_acc <- 0.7935259
+avg_prec <- 0.7399228
+avg_rec <- 0.9050575
+avg_f1 <- 0.8139437
+```
+
+```{r Random Forest, echo=F, message=F, warning=F}
+library(randomForest)
+# initialize scores matrix
+scores <- matrix(,nrow=k,ncol=4)
+
+# warning: this takes 6-8hrs
+# I summarized the scores below
+for(i in 1:(k-1)) {
+  # train/test split
+  train <- tSparse[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test <- tSparse[split[(((i-1)*n_k)+1):(i*n_k)],]
+  # train RF model
+  modelRF = randomForest(label ~ ., data=train)
+  # predict with RF
+  predictRF = predict(modelRF, newdata=test)
+  # confusion matrix
+  cat("\n#######################\n")
+  table(test$label, predictRF)
+  cat("\n")
+  scores[i,] <- score(predictRF, test$label)
+}
+# need one more iteration outside for-loop to account for remaining
+# observations (6335-9*633) because n/k is not an integer
+i <- k
+# train/test split
+train <- tSparse[-split[(((i-1)*n_k)+1):dim(tSparse)[1]],]
+test <- tSparse[split[(((i-1)*n_k)+1):dim(tSparse)[1]],]
+# train RF model
+modelRF = randomForest(label ~ ., data=train)
+# predict with RF
+predictRF = predict(modelRF, newdata=test)
+# confusion matrix
+cat("\n#######################\n")
+table(test$label, predictRF)
+cat("\n")
+scores[i,] <- score(predictRF, test$label)
+# k-fold average scores
+avg_acc <- 0.9243769
+avg_prec <- 0.9226073
+avg_rec <- 0.9260733
+avg_f1 <- 0.9241894
+```
 
 
-# 2 Executive Summary
 
-# 3 Data Preprocessing
-Language is an art, and thus an inherently complex domain for machine learning. There is an entire grammar governing the rules and guidelines of how to compose a sentence, a paragraph, a complete story. Words have many meanings and be used very specifically with nuance or very broadly and loosely. There is meaning in word choice. Style, voice, and tone that can be folded in. Understanding the author, the audience, and the context adds even more depth. So how do we work with language such that machine learning algorithms can use this data?
+```{r Build N-Grams, echo=F, message=F, warning=F}
+# this block of code isn't full working yet...
+# I'm not exactly sure what the n-gram document term matrix even looks like
+# here is a link to an article I was following
+# https://medium.com/@ibtissam.makdoun/creating-n-grams-using-r-2dcc0cde4af5
+library(RWeka)
+BigramTokenizer <- function(x) {
+  NGramTokenizer(x, Weka_control(min = 1, max = 2))
+}
+TrigramTokenizer <- function(x) {
+  NGramTokenizer(x, Weka_control(min = 1, max = 3))
+}
+# create document term matrix of bigrams
+frequencies2 = DocumentTermMatrix(corpus, control = list(tokenize = BigramTokenizer))
+# remove terms with frequencies < 0.05
+sparse2 = removeSparseTerms(frequencies2, 0.95)
+# create data frame of sparse frequencies (including labels)
+tSparse2 = as.data.frame(as.matrix(sparse2))
+colnames(tSparse2) = make.names(colnames(tSparse2), unique=T)
+tSparse2$label = news$label
+tSparse2$label <- as.factor(tSparse2$label)
 
-To start, we are going to first clean the text. To do this, we must tokenize the body of the text into the individual words. We use the `tm` package to achieve this and the subsequent steps. We convert all letters to lowercase and remove punctuation. For our purposes, these conventions are not going to be necessary. Next we must consider that not every word in a document is important. Many words do not add much meaning but are usually just grammatical (eg “the”, “and”, “of”, “is”). We call these stopwords - common words that contain no significant meaning. There is a stopword list built in to the `tm` package that we used here. We also want to do what is called stemming and lemmatization. This essentially factors a word down to its base component, reducing the many derivations of a word to one single item (eg “ran”, “running”, “runner” = “run”). We use the `SnowballC` package for stemming. Somehow, this stemming and lematization process converted some words back into stopwords, so we performed stopword removal again here. The final step is to vectorize or transform the text into a numerical format that the model can process. This means generating a matrix where each row is an article, and each column is a possible word in the dictionary. The matrix counts how many of each word are found in the given article. So an article is transformed into a sparse list of word counts - mostly zeros because an article contains only a small selection of all possible words in the dictionary.
+# create document term matrix of trigrams
+frequencies3 = DocumentTermMatrix(corpus, control = list(tokenize = TrigramTokenizer))
+# remove terms with frequencies < 0.05
+sparse3 = removeSparseTerms(frequencies3, 0.95)
+# create data frame of sparse frequencies (including labels)
+tSparse3 = as.data.frame(as.matrix(sparse3))
+colnames(tSparse3) = make.names(colnames(tSparse3), unique=T)
+tSparse3$label = news$label
+tSparse3$label <- as.factor(tSparse3$label)
 
-We also decided to experiment with n-grams, or n-sized word groupings. Individual words contain meaning, but there is more meaning in multiple words strung together. For example in "trading good" vs. "trading" and "good". The different encodings have very different meanings. The 2-gram "trading good" refers to an item that is traded while the 1-gram interpretation "trading" and "good" puts a positive spin on a trade. Of course as we increase n, we stand to gain more information but at the cost of expensive computation.
+for(i in 1:(k-1)) {
+  # train/test split
+  train2 <- tSparse2[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test2 <- tSparse2[split[(((i-1)*n_k)+1):(i*n_k)],]
+  train3 <- tSparse3[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test3 <- tSparse3[split[(((i-1)*n_k)+1):(i*n_k)],]
+  # train NB model
+  modelNB2 = naiveBayes(label ~ ., data=train2)
+  modelNB3 = naiveBayes(label ~ ., data=train3)
+  # predict with NB
+  predictNB2 = predict(modelNB2, newdata=test2)
+  predictNB3 = predict(modelNB3, newdata=test3)
+  # confusion matrix
+  cat("\n#######################\n")
+  cat("2-gram\n")
+  table(test2$label, predictNB2)
+  cat("\n")
+  scores2[i,] <- score(predictNB2, test2$label)
+  cat("\n#######################\n")
+  cat("3-gram\n")
+  table(test3$label, predictNB3)
+  cat("\n")
+  scores3[i,] <- score(predictNB3, test3$label)
+}
+# need one more iteration outside for-loop to account for remaining
+# observations (6335-9*633) because n/k is not an integer
+i <- k
+# train/test split
+train2 <- tSparse2[-split[(((i-1)*n_k)+1):dim(tSparse2)[1]],]
+test2 <- tSparse2[split[(((i-1)*n_k)+1):dim(tSparse2)[1]],]
+train3 <- tSparse3[-split[(((i-1)*n_k)+1):dim(tSparse3)[1]],]
+test3 <- tSparse3[split[(((i-1)*n_k)+1):dim(tSparse3)[1]],]
+# train NB model
+modelNB2 = naiveBayes(label ~ ., data=train2)
+modelNB3 = naiveBayes(label ~ ., data=train3)
+# predict with NB
+predictNB2 = predict(modelNB2, newdata=test2)
+predictNB3 = predict(modelNB3, newdata=test3)
+# confusion matrix
+cat("\n#######################\n")
+cat("2-gram\n")
+table(test2$label, predictNB2)
+cat("\n")
+scores2[i,] <- score(predictNB2, test2$label)
+cat("\n#######################\n")
+cat("3-gram\n")
+table(test3$label, predictNB3)
+cat("\n")
+scores3[i,] <- score(predictNB3, test3$label)
 
-# 4 Exploratory Analysis
+# k-fold average scores
+avg_score2 <- rep(NA, 4)
+avg_score3 <- rep(NA, 4)
+for(i in 1:4) {
+  avg_score2[i] <- mean(scores2[,i])
+  avg_score3[i] <- mean(scores3[,i])
+}
+avg_acc2 <- 0.8274589
+avg_prec2 <- 0.7635951
+avg_rec2 <- 0.9477520
+avg_f12 <- 0.8456242
+avg_acc3 <- 0.8201932
+avg_prec3 <- 0.7524047
+avg_rec3 <- 0.9537779
+avg_f13 <- 0.8410367
+```
 
-# 5 Model development and performance evaluation
 
-# 6 Conclusion
+```{r Logistic Regression, echo=F, message=F, warning=F}
+n <- dim(tSparse)[1]
+k <- 10
+n_k <- floor(n/k)
+indices <- 1:n
+split <- sample(indices, n, replace=F)
+
+score <- function(prediction, actual) {
+  accuracy <- mean(prediction == actual)
+  cat("Accuracy: ", accuracy, "\n")
+  precision <- sum(prediction == "FAKE" & prediction == actual)/sum(prediction == "FAKE")
+  cat("Precision: ", precision, "\n")
+  recall <- sum(prediction == "FAKE" & prediction == actual)/sum(actual == "FAKE")
+  cat("Recall: ", recall, "\n")
+  f1 <- 2*precision*recall/(precision+recall)
+  cat("F1: ", f1, "\n")
+  out <- rep(0,4)
+  out[1:4] = c(accuracy, precision, recall, f1)
+  return(out)
+}
+
+# initialize scores matrix
+scores <- matrix(,nrow=k,ncol=4)
+
+# warning: this takes 6-8hrs
+# I summarized the scores below
+for(i in 1:(k-1)) {
+  # train/test split
+  train <- tSparse[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test <- tSparse[split[(((i-1)*n_k)+1):(i*n_k)],]
+  # train LR model
+  modelLR = glm(label ~ ., data=train, family="binomial")
+  # predict with LR
+  predictLR = predict(modelLR, newdata=test, type="response")
+  predictLR = factor(round(predictLR, digits=0))
+  levels(predictLR) = c("FAKE", "REAL")
+  # confusion matrix
+  cat("\n#######################\n")
+  table(test$label, predictLR)
+  cat("\n")
+  scores[i,] <- score(predictLR, test$label)
+}
+# need one more iteration outside for-loop to account for remaining
+# observations (6335-9*633) because n/k is not an integer
+i <- k
+# train/test split
+train <- tSparse[-split[(((i-1)*n_k)+1):dim(tSparse)[1]],]
+test <- tSparse[split[(((i-1)*n_k)+1):dim(tSparse)[1]],]
+# train LR model
+modelLR = glm(label ~ ., data=train, family="binomial")
+# predict with LR
+predictLR = predict(modelLR, newdata=test, type="response")
+predictLR = factor(round(predictLR, digits=0))
+levels(predictLR) = c("FAKE", "REAL")
+# confusion matrix
+cat("\n#######################\n")
+cat("\n")
+scores[i,] <- score(predictLR, test$label)
+
+LR_ONEGRAM_ACCURACY <- 0.8413687
+LR_ONEGRAM_PRECISION <- 0.8083161
+LR_ONEGRAM_RECALL <- 0.8910022
+LR_ONEGRAM_F1 <- 0.8419598
+
+LR_BIGRAM_ACCURACY <- 0.7685728
+LR_BIGRAM_PRECISION <- 0.7216141
+LR_BIGRAM_RECALL <- 0.8731681
+LR_BIGRAM_F1 <- 0.790001
+
+LR_TRIGRAM_ACCURACY <- 0.5428675
+LR_TRIGRAM_PRECISION <- 0.523995
+LR_TRIGRAM_RECALL <- 0.9242782
+LR_TRIGRAM_F1 <- 0.6684849
+```
+
+
+```{r N-Grams Logistic Regression, echo=F, message=F, warning=F}
+# initialize scores matrix
+scores2 <- matrix(,nrow=k,ncol=4)
+scores3 <- matrix(,nrow=k,ncol=4)
+
+# Logistic Regression
+for(i in 1:(k-1)) {
+  # train/test split
+  train2 <- tSparse2[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test2 <- tSparse2[split[(((i-1)*n_k)+1):(i*n_k)],]
+  train3 <- tSparse3[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test3 <- tSparse3[split[(((i-1)*n_k)+1):(i*n_k)],]
+  # train LR model
+  modelLR2 = glm(label ~ ., data=train2, family="binomial")
+  modelLR3 = glm(label ~ ., data=train3, family="binomial")
+  # predict with LR
+  predictLR2 = predict(modelLR2, newdata=test2, type="response")
+  predictLR2 = factor(round(predictLR2, digits=0))
+  levels(predictLR2) = c("FAKE", "REAL")
+  predictLR3 = predict(modelLR3, newdata=test3, type="response")
+  predictLR3 = factor(round(predictLR3, digits=0))
+  levels(predictLR3) = c("FAKE", "REAL")
+  # confusion matrix
+  cat("\n#######################\n")
+  cat("2-gram\n")
+  table(test2$label, predictLR2)
+  cat("\n")
+  scores2[i,] <- score(predictLR2, test2$label)
+  cat("\n#######################\n")
+  cat("3-gram\n")
+  table(test3$label, predictLR3)
+  cat("\n")
+  scores3[i,] <- score(predictLR3, test3$label)
+}
+# need one more iteration outside for-loop to account for remaining
+# observations (6335-9*633) because n/k is not an integer
+i <- k
+# train/test split
+train2 <- tSparse2[-split[(((i-1)*n_k)+1):dim(tSparse2)[1]],]
+test2 <- tSparse2[split[(((i-1)*n_k)+1):dim(tSparse2)[1]],]
+train3 <- tSparse3[-split[(((i-1)*n_k)+1):dim(tSparse3)[1]],]
+test3 <- tSparse3[split[(((i-1)*n_k)+1):dim(tSparse3)[1]],]
+# train LR model
+modelLR2 = glm(label ~ ., data=train2, family="binomial")
+modelLR3 = glm(label ~ ., data=train3, family="binomial")
+# predict with LR
+predictLR2 = predict(modelLR2, newdata=test2, type="response")
+predictLR2 = factor(round(predictLR2, digits=0))
+levels(predictLR2) = c("FAKE", "REAL")
+predictLR3 = predict(modelLR3, newdata=test3, type="response")
+predictLR3 = factor(round(predictLR3, digits=0))
+levels(predictLR3) = c("FAKE", "REAL")
+  # confusion matrix
+cat("\n#######################\n")
+cat("2-gram\n")
+table(test2$label, predictLR2)
+cat("\n")
+scores2[i,] <- score(predictLR2, test2$label)
+cat("\n#######################\n")
+cat("3-gram\n")
+table(test3$label, predictLR3)
+cat("\n")
+scores3[i,] <- score(predictLR3, test3$label)
+
+# k-fold average scores
+avg_score2 <- rep(NA, 4)
+avg_score3 <- rep(NA, 4)
+for(i in 1:4) {
+  avg_score2[i] <- mean(scores2[,i])
+  avg_score3[i] <- mean(scores3[,i])
+}
+avg_acc2 <- 0.8274589
+avg_prec2 <- 0.7635951
+avg_rec2 <- 0.9477520
+avg_f12 <- 0.8456242
+avg_acc3 <- 0.8201932
+avg_prec3 <- 0.7524047
+avg_rec3 <- 0.9537779
+avg_f13 <- 0.8410367
+```
+
+
+```{r N-Grams Random Forest, echo=F, message=F, warning=F}
+library(randomForest)
+# initialize scores matrix
+scores <- matrix(,nrow=k,ncol=4)
+
+# warning: this takes 6-8hrs
+# I summarized the scores below
+for(i in 1:(k-1)) {
+  # train/test split
+  train3 <- tSparse3[-split[(((i-1)*n_k)+1):(i*n_k)],]
+  test3 <- tSparse3[split[(((i-1)*n_k)+1):(i*n_k)],]
+  # train RF model
+  modelRF3 = randomForest(label ~ ., data=train3)
+  # predict with RF
+  predictRF3 = predict(modelRF3, newdata=test3)
+  # confusion matrix
+  cat("\n#######################\n")
+  table(test3$label, predictRF3)
+  cat("\n")
+  scores[i,] <- score(predictRF3, test3$label)
+}
+# need one more iteration outside for-loop to account for remaining
+# observations (6335-9*633) because n/k is not an integer
+i <- k
+# train/test split
+train3 <- tSparse3[-split[(((i-1)*n_k)+1):dim(tSparse3)[1]],]
+test3 <- tSparse3[split[(((i-1)*n_k)+1):dim(tSparse3)[1]],]
+# train RF model
+modelRF3 = randomForest(label ~ ., data=train3)
+# predict with RF
+predictRF3 = predict(modelRF3, newdata=test3)
+# confusion matrix
+cat("\n#######################\n")
+table(test3$label, predictRF3)
+cat("\n")
+scores[i,] <- score(predictRF3, test3$label)
+# k-fold  scores
+kfoldF1 <- c(0.8978224, 0.9096672, 0.9281250, 0.9129771, 0.9304348, 0.9318182, 0.9093904, 0.9193303, 0.9298532, 0.9167975)
+```
+
+
+
